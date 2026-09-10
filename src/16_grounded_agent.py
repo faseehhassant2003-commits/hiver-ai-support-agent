@@ -1,26 +1,19 @@
-import os
 import json
+import os
+import pickle
+
+import numpy as np
 import pandas as pd
-
+from sentence_transformers import SentenceTransformer
 from groq import Groq
-from sentence_transformers import SentenceTransformer, util
 
 
-# =========================================================
-# 1. Configuration
-# =========================================================
+DATA_PATH = "data/amazon_pairs.csv"
+EMBEDDING_PATH = "data/amazon_embeddings.npy"
 
-DATA_FILE = "data/amazon_pairs.csv"
-MODEL_NAME = "openai/gpt-oss-20b"
+MODEL_NAME = "all-MiniLM-L6-v2"
 
-customer_message = "My package says delivered but I never received it."
-
-
-# =========================================================
-# 2. Allowed intents
-# =========================================================
-
-ALLOWED_INTENTS = [
+INTENTS = [
     "delivery_missing",
     "order_preorder",
     "refund_payment",
@@ -34,239 +27,231 @@ ALLOWED_INTENTS = [
 ]
 
 
-# =========================================================
-# 3. Check API key
-# =========================================================
+def load_data():
+    df = pd.read_csv(DATA_PATH)
 
-api_key = os.getenv("GROQ_API_KEY")
+    # Remove empty customer messages
+    df = df.dropna(subset=["customer_text"]).reset_index(drop=True)
 
-if not api_key:
-    raise RuntimeError(
-        "GROQ_API_KEY not found."
+    return df
+
+
+def load_or_create_embeddings(df, model):
+    if os.path.exists(EMBEDDING_PATH):
+        print("Loading saved embeddings...")
+        embeddings = np.load(EMBEDDING_PATH)
+
+        # Make sure the saved embeddings match the current dataset
+        if len(embeddings) == len(df):
+            print("Embeddings loaded successfully!")
+            return embeddings
+
+        print("Saved embeddings do not match dataset. Rebuilding...")
+
+    print("Creating embeddings...")
+    embeddings = model.encode(
+        df["customer_text"].tolist(),
+        show_progress_bar=True,
+        convert_to_numpy=True,
     )
 
-client = Groq(api_key=api_key)
+    np.save(EMBEDDING_PATH, embeddings)
+
+    print(f"Saved embeddings to {EMBEDDING_PATH}")
+
+    return embeddings
 
 
-# =========================================================
-# 4. Load historical data
-# =========================================================
+def retrieve_cases(query, df, embeddings, model, top_k=5):
+    query_embedding = model.encode(
+        [query],
+        convert_to_numpy=True,
+    )[0]
 
-print("Loading Amazon historical conversations...")
+    # Cosine similarity
+    query_norm = np.linalg.norm(query_embedding)
+    embedding_norms = np.linalg.norm(embeddings, axis=1)
 
-df = pd.read_csv(DATA_FILE)
+    similarities = np.dot(embeddings, query_embedding) / (
+        embedding_norms * query_norm + 1e-10
+    )
 
-df["customer_text"] = df["customer_text"].fillna("")
-df["amazon_reply"] = df["amazon_reply"].fillna("")
+    top_indices = np.argsort(similarities)[::-1][:top_k]
 
-texts = df["customer_text"].tolist()
+    results = []
 
-print(f"Loaded {len(texts):,} historical customer messages.")
+    for index in top_indices:
+        results.append(
+            {
+                "customer_text": df.iloc[index]["customer_text"],
+                "amazon_reply": df.iloc[index]["amazon_reply"],
+                "similarity": float(similarities[index]),
+            }
+        )
 
-
-# =========================================================
-# 5. Semantic embeddings
-# =========================================================
-
-print("Loading embedding model...")
-
-embedding_model = SentenceTransformer(
-    "all-MiniLM-L6-v2"
-)
-
-print("Creating embeddings...")
-
-embeddings = embedding_model.encode(
-    texts,
-    convert_to_tensor=True,
-    show_progress_bar=True
-)
-
-print("Embeddings ready!")
+    return results
 
 
-# =========================================================
-# 6. Retrieve similar historical cases
-# =========================================================
+def decide_escalation(intent, top_similarity):
+    high_risk_intents = {
+        "refund_payment",
+        "account_prime",
+        "return_cancellation",
+        "complaint_service",
+    }
 
-query_embedding = embedding_model.encode(
-    customer_message,
-    convert_to_tensor=True
-)
+    minimum_similarity = 0.65
 
-scores = util.cos_sim(
-    query_embedding,
-    embeddings
-)[0]
+    if intent in high_risk_intents:
+        return (
+            "ESCALATE",
+            f"High-risk intent: {intent} requires human handling.",
+        )
 
-top_k = 5
+    if top_similarity < minimum_similarity:
+        return (
+            "ESCALATE",
+            f"Historical evidence is weak (top similarity={top_similarity:.3f}).",
+        )
 
-top_results = scores.topk(k=top_k)
-
-historical_cases = []
-
-for score, index in zip(
-    top_results.values,
-    top_results.indices
-):
-
-    index = int(index)
-
-    historical_cases.append({
-        "similarity": float(score),
-        "customer": df.iloc[index]["customer_text"],
-        "amazon": df.iloc[index]["amazon_reply"],
-    })
+    return (
+        "AUTO",
+        f"Known low-risk intent with strong historical evidence "
+        f"(top similarity={top_similarity:.3f}).",
+    )
 
 
-# =========================================================
-# 7. Build evidence
-# =========================================================
+def call_groq(customer_message, retrieved_cases):
+    api_key = os.getenv("GROQ_API_KEY")
 
-evidence = ""
+    if not api_key:
+        raise RuntimeError(
+            "GROQ_API_KEY is not set. "
+            "Set it in PowerShell before running the program."
+        )
 
-for i, case in enumerate(historical_cases, start=1):
+    client = Groq(api_key=api_key)
 
-    evidence += f"""
+    evidence = ""
+
+    for i, case in enumerate(retrieved_cases, start=1):
+        evidence += f"""
 CASE {i}
-Similarity: {case['similarity']:.3f}
-
-Customer:
-{case['customer']}
-
-Historical Amazon reply:
-{case['amazon']}
-----------------------------------------
+Similarity: {case["similarity"]:.3f}
+Customer: {case["customer_text"]}
+Historical Amazon reply: {case["amazon_reply"]}
 """
 
+    prompt = f"""
+You are an Amazon customer-support assistant.
 
-# =========================================================
-# 8. LLM instructions
-# =========================================================
+Customer message:
+{customer_message}
 
-system_prompt = f"""
-You are a careful Amazon customer-support assistant.
+Historical evidence:
+{evidence}
 
-You must:
-
-1. Classify the customer's primary intent.
-2. Decide AUTO or ESCALATE.
-3. Give a short reason.
-4. Write a customer-facing reply.
-
-The intent MUST be exactly one of:
-
-{", ".join(ALLOWED_INTENTS)}
-
-The decision MUST be exactly one of:
-
-AUTO
-ESCALATE
+Choose exactly ONE intent from this list:
+{INTENTS}
 
 Rules:
+- Classify based on the customer's main problem.
+- Use the historical evidence to ground the answer.
+- Do not invent policies, refunds, replacements, investigations,
+  compensation, account actions, or URLs.
+- Do not claim that you performed an action.
+- Do not ask the customer to publicly share private information.
+- Keep the reply concise and helpful.
+- Return ONLY valid JSON.
 
-- Use historical Amazon replies as your main evidence.
-- Do not invent Amazon policies.
-- Do not invent URLs.
-- Do not promise refunds, replacements, investigations,
-  compensation, or account actions unless supported by evidence.
-- Do not request private account/order information publicly.
-- If the issue requires private account/order investigation,
-  prefer ESCALATE.
-- If the evidence is weak or unclear, prefer ESCALATE.
-- Keep the reply concise.
-- Do not mention that you are an AI.
-- Do not mention the historical cases.
-
-Return ONLY valid JSON:
-
+JSON format:
 {{
-  "intent": "one_allowed_intent",
-  "decision": "AUTO or ESCALATE",
-  "reason": "short explanation",
-  "reply": "customer-facing response"
+  "intent": "one_exact_intent_from_the_list",
+  "reply": "customer-facing reply"
 }}
 """
 
-
-user_prompt = f"""
-Customer message:
-
-{customer_message}
-
-Historical Amazon support evidence:
-
-{evidence}
-"""
-
-
-# =========================================================
-# 9. Call Groq
-# =========================================================
-
-print("Asking Groq...")
-
-response = client.chat.completions.create(
-    model=MODEL_NAME,
-    messages=[
-        {
-            "role": "system",
-            "content": system_prompt,
-        },
-        {
-            "role": "user",
-            "content": user_prompt,
-        },
-    ],
-    temperature=0.1,
-)
-
-
-# =========================================================
-# 10. Parse response
-# =========================================================
-
-raw_answer = response.choices[0].message.content.strip()
-
-try:
-    result = json.loads(raw_answer)
-
-except json.JSONDecodeError:
-    print("\nGroq returned invalid JSON:")
-    print(raw_answer)
-    raise RuntimeError("Invalid JSON returned by Groq.")
-
-
-# =========================================================
-# 11. Validate output
-# =========================================================
-
-if result.get("intent") not in ALLOWED_INTENTS:
-    raise ValueError(
-        f"Invalid intent returned: {result.get('intent')}"
+    response = client.chat.completions.create(
+        model="openai/gpt-oss-20b",
+        messages=[
+            {
+                "role": "system",
+                "content": "You are a careful customer support assistant.",
+            },
+            {
+                "role": "user",
+                "content": prompt,
+            },
+        ],
+        temperature=0,
     )
 
-if result.get("decision") not in ["AUTO", "ESCALATE"]:
-    raise ValueError(
-        f"Invalid decision returned: {result.get('decision')}"
+    content = response.choices[0].message.content.strip()
+
+    return json.loads(content)
+
+
+def run_agent(customer_message):
+    print("Loading Amazon historical conversations...")
+
+    df = load_data()
+
+    print(f"Loaded {len(df):,} historical customer messages.")
+
+    print("Loading embedding model...")
+
+    model = SentenceTransformer(MODEL_NAME)
+
+    embeddings = load_or_create_embeddings(df, model)
+
+    print("Embeddings ready!")
+
+    print("Retrieving similar historical cases...")
+
+    retrieved_cases = retrieve_cases(
+        customer_message,
+        df,
+        embeddings,
+        model,
+        top_k=5,
     )
 
+    print("\nTOP HISTORICAL CASES")
 
-# =========================================================
-# 12. Display
-# =========================================================
+    for i, case in enumerate(retrieved_cases, start=1):
+        print(f"\n{i}. Similarity: {case['similarity']:.3f}")
+        print(f"Customer: {case['customer_text']}")
+        print(f"Amazon: {case['amazon_reply']}")
 
-print()
-print("=" * 70)
-print("HIVER GROUNDED AI AGENT")
-print("=" * 70)
+    result = call_groq(customer_message, retrieved_cases)
 
-print("\nCUSTOMER:")
-print(customer_message)
+    top_similarity = retrieved_cases[0]["similarity"]
 
-print("\nRESULT:")
-print(json.dumps(
-    result,
-    indent=2,
-    ensure_ascii=False
-))
+    decision, reason = decide_escalation(
+        result["intent"],
+        top_similarity,
+    )
+
+    final_result = {
+        "intent": result["intent"],
+        "decision": decision,
+        "reason": reason,
+        "reply": result["reply"],
+    }
+
+    print("\nRESULT:")
+    print(json.dumps(final_result, indent=2, ensure_ascii=False))
+
+
+
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) < 2:
+        print("Usage:")
+        print('py src\\16_grounded_agent.py "your customer message"')
+        sys.exit(1)
+
+    customer_message = " ".join(sys.argv[1:])
+
+    run_agent(customer_message)
